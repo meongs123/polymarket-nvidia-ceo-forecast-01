@@ -1,20 +1,23 @@
 # Polymarket "Next CEO of NVIDIA?" price forecaster (make.fun bounty
 # polymarket-nvidia-ceo-forecast-01). Python 3.13, standard library only.
 #
-# Model (tuned on the six practice cases, practice pinball loss 0.259290 vs the
-# house baseline's 0.363589; 90% coverage ~0.86, i.e. honest calibration):
+# Model (tuned on the six practice cases, practice pinball loss 0.253213 vs
+# the house baseline's 0.363589; median error 0.7262, 90% coverage ~0.88):
 #
-#   * Median: persistence plus a sum correction. The 24 Yes prices are
-#     mutually exclusive outcomes, so they must sum to 1 -- but at the
-#     practice checkpoints they summed to 0.81-1.09. When the sum S is off,
-#     the median drifts toward x / S with a 120-minute time constant, i.e.
-#     the market's mispricing is assumed to unwind over ~2h. This is the
-#     single biggest win over plain persistence (0.272 -> 0.260): it helps
-#     exactly where the sum is farthest from 1 (p00, p02, p04) and does
-#     nothing where the sum is already 1 (p01). Plain mean reversion to a
-#     60-min mean and reverting after big jumps both made the loss WORSE
-#     (median error up), so there is no other drift: prices are martingales
-#     except for the sum constraint.
+#   * Median: the last TWO minutes averaged, plus a sum correction. The
+#     1-minute CLOB midpoint carries microstructure noise (a single tick
+#     can sit a point or two off the true price), so the base price is the
+#     mean of the last two minutes -- worth ~0.006 of practice loss over
+#     the raw last price, and the 0.5-0.7 weighting plateau is flat, so it
+#     is not a knife-edge fit. The 24 Yes prices are mutually exclusive
+#     outcomes, so they must sum to 1 -- but at the practice checkpoints
+#     they summed to 0.81-1.09. When the sum S is off, the median drifts
+#     toward x / S with a 120-minute time constant, i.e. the market's
+#     mispricing is assumed to unwind over ~2h. This helps exactly where
+#     the sum is farthest from 1 (p00, p02, p04) and does nothing where
+#     the sum is already 1 (p01). Plain mean reversion to a 60-min mean
+#     and reverting after big jumps both made the loss WORSE, so there is
+#     no other drift: prices are martingales except for the sum constraint.
 #   * Spread: per-market, adaptive. sigma is the mean absolute 1-minute
 #     return (x1.2533, the normal equivalent), blended 70% from the last 6h
 #     with 30% from the last 24h. The 6h half tracks the current volatility
@@ -27,10 +30,14 @@
 #     moves scale the same way.
 #   * Horizon shape: quantiles widen as h**0.40, slower than a random
 #     walk's sqrt(h). These are bounded probabilities that sit still for
-#     long stretches, so long-horizon spread grows slower than sqrt(h);
-#     0.40 beat 0.45 and 0.5 on the practice once the sum correction was in.
-#   * Shape: plain normal quantiles. Heavier (Student-t) tails and
-#     logit-space forecasts both lost on the practice once the blend was in.
+#     long stretches, so long-horizon spread grows slower than sqrt(h).
+#   * Shape: Laplace quantiles, not normal. One-minute returns are
+#     zero-inflated -- the price sits still for many minutes, then jumps --
+#     so the forecast distribution has a sharper peak and heavier tails
+#     than a normal. Laplace z's are ln(2*tau): -2.3026, -0.6931, 0,
+#     0.6931, 2.3026, with scale = mean absolute move (sigma / 1.2533).
+#     Worth ~0.001 over normal on the practice, and the same shape shows
+#     up in the board's #3 entry, so it is not a one-off fit.
 #   * Every quantile is clamped to [0, 1] and rounded to 6 decimals.
 #
 # Deterministic: pure arithmetic on the case file, no randomness, no network,
@@ -44,8 +51,9 @@ INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
-# Standard normal quantiles at the five levels.
-Z = [-1.644854, -0.67449, 0.0, 0.67449, 1.644854]
+# Laplace quantiles at the five levels: ln(2*tau) for tau < 0.5,
+# -ln(2*(1-tau)) for tau > 0.5.
+Z = [-2.302585, -0.693147, 0.0, 0.693147, 2.302585]
 
 # Blend weights for the two volatility windows (minutes).
 SHORT_WINDOW = 360    # 6h: tracks the current regime
@@ -58,6 +66,7 @@ SIGMA_CAP = 0.008
 SIGMA_FALLBACK = 0.0025  # for a market with too little history
 ALPHA = 0.40             # spread grows as h ** ALPHA
 SUM_TAU = 120            # minutes: median unwinds toward x / S on this scale
+NORMAL_EQUIV = 1.2533    # mean absolute move -> normal-equivalent sigma
 
 
 def price6(x):
@@ -75,7 +84,7 @@ def mean_abs_sigma(prices, window):
     total = 0.0
     for i in range(len(seg) - 1):
         total += abs(seg[i + 1] - seg[i])
-    return total / (len(seg) - 1) * 1.2533
+    return total / (len(seg) - 1) * NORMAL_EQUIV
 
 
 def market_sigma(prices):
@@ -93,27 +102,33 @@ def market_sigma(prices):
 
 
 def forecast_market(market, horizon, total):
-    """240 rows of five quantiles for one market. The median starts at the
-    last price and unwinds toward x / total (the sum-to-one correction);
-    the spread scales by 1 / total with it."""
+    """240 rows of five quantiles for one market. The base price is the mean
+    of the last two minutes (microstructure noise); the median unwinds
+    toward x / total (the sum-to-one correction); the spread scales by
+    1 / total with it and follows Laplace quantiles."""
     prices = market.get("prices") or []
     if not prices:
         # No history at all: stay valid with a flat 0.5 forecast.
         return [[0.5, 0.5, 0.5, 0.5, 0.5] for _ in range(horizon)]
-    x = prices[-1]
+    if len(prices) >= 2:
+        x = (prices[-1] + prices[-2]) / 2.0
+    else:
+        x = prices[-1]
     sigma = market_sigma(prices)
     if total > 0:
         target = x / total
         sigma = sigma / total
     else:
         target = x
+    # Laplace scale is the mean absolute move, i.e. sigma / 1.2533.
+    scale = sigma / NORMAL_EQUIV
     # Horizon growth factors, computed once per market instead of per row.
     growth = [h ** ALPHA for h in range(1, horizon + 1)]
     unwind = [1.0 - math.exp(-h / SUM_TAU) for h in range(1, horizon + 1)]
     rows = []
     for h in range(1, horizon + 1):
         median = x + (target - x) * unwind[h - 1]
-        spread = sigma * growth[h - 1]
+        spread = scale * growth[h - 1]
         rows.append([price6(median + z * spread) for z in Z])
     return rows
 
