@@ -1,13 +1,20 @@
 # Polymarket "Next CEO of NVIDIA?" price forecaster (make.fun bounty
 # polymarket-nvidia-ceo-forecast-01). Python 3.13, standard library only.
 #
-# Model (tuned on the six practice cases, practice pinball loss ~0.272 vs the
-# house baseline's 0.363589; 90% coverage ~0.91, i.e. honest calibration):
+# Model (tuned on the six practice cases, practice pinball loss 0.259290 vs the
+# house baseline's 0.363589; 90% coverage ~0.86, i.e. honest calibration):
 #
-#   * Median: persistence -- the price at the checkpoint. Prediction-market
-#     prices are (near-)martingales at a 4h horizon; every drift we tried
-#     (mean reversion to a 60-min mean, pull toward the cross-market sum of 1)
-#     made the practice loss worse, so the median stays put.
+#   * Median: persistence plus a sum correction. The 24 Yes prices are
+#     mutually exclusive outcomes, so they must sum to 1 -- but at the
+#     practice checkpoints they summed to 0.81-1.09. When the sum S is off,
+#     the median drifts toward x / S with a 120-minute time constant, i.e.
+#     the market's mispricing is assumed to unwind over ~2h. This is the
+#     single biggest win over plain persistence (0.272 -> 0.260): it helps
+#     exactly where the sum is farthest from 1 (p00, p02, p04) and does
+#     nothing where the sum is already 1 (p01). Plain mean reversion to a
+#     60-min mean and reverting after big jumps both made the loss WORSE
+#     (median error up), so there is no other drift: prices are martingales
+#     except for the sum constraint.
 #   * Spread: per-market, adaptive. sigma is the mean absolute 1-minute
 #     return (x1.2533, the normal equivalent), blended 70% from the last 6h
 #     with 30% from the last 24h. The 6h half tracks the current volatility
@@ -15,11 +22,13 @@
 #     here: one 20-point jump in 24h inflates it so far that the intervals
 #     are far too wide at every quiet minute. Mean absolute move is
 #     jump-resistant and won on all six practice cases, early and late.
-#     Floor 0.0003, cap 0.008 price units per minute.
-#   * Horizon shape: quantiles widen as h**0.45, slightly slower than a
-#     random walk's sqrt(h). These are bounded probabilities that sit still
-#     for long stretches, so long-horizon spread grows slower than sqrt(h);
-#     0.45 beat 0.5 and 0.4 on the practice, and the 0.42-0.48 band is flat.
+#     Floor 0.0003, cap 0.008 price units per minute. The sigma scales by
+#     1/S with the median: if the price level is corrected by 1/S, its
+#     moves scale the same way.
+#   * Horizon shape: quantiles widen as h**0.40, slower than a random
+#     walk's sqrt(h). These are bounded probabilities that sit still for
+#     long stretches, so long-horizon spread grows slower than sqrt(h);
+#     0.40 beat 0.45 and 0.5 on the practice once the sum correction was in.
 #   * Shape: plain normal quantiles. Heavier (Student-t) tails and
 #     logit-space forecasts both lost on the practice once the blend was in.
 #   * Every quantile is clamped to [0, 1] and rounded to 6 decimals.
@@ -47,7 +56,8 @@ LONG_WEIGHT = 0.3
 SIGMA_FLOOR = 0.0003
 SIGMA_CAP = 0.008
 SIGMA_FALLBACK = 0.0025  # for a market with too little history
-ALPHA = 0.45             # spread grows as h ** ALPHA
+ALPHA = 0.40             # spread grows as h ** ALPHA
+SUM_TAU = 120            # minutes: median unwinds toward x / S on this scale
 
 
 def price6(x):
@@ -82,20 +92,29 @@ def market_sigma(prices):
     return min(SIGMA_CAP, max(SIGMA_FLOOR, blended))
 
 
-def forecast_market(market, horizon):
-    """240 rows of five quantiles for one market, median = last price."""
+def forecast_market(market, horizon, total):
+    """240 rows of five quantiles for one market. The median starts at the
+    last price and unwinds toward x / total (the sum-to-one correction);
+    the spread scales by 1 / total with it."""
     prices = market.get("prices") or []
     if not prices:
         # No history at all: stay valid with a flat 0.5 forecast.
         return [[0.5, 0.5, 0.5, 0.5, 0.5] for _ in range(horizon)]
     x = prices[-1]
     sigma = market_sigma(prices)
+    if total > 0:
+        target = x / total
+        sigma = sigma / total
+    else:
+        target = x
     # Horizon growth factors, computed once per market instead of per row.
     growth = [h ** ALPHA for h in range(1, horizon + 1)]
+    unwind = [1.0 - math.exp(-h / SUM_TAU) for h in range(1, horizon + 1)]
     rows = []
     for h in range(1, horizon + 1):
+        median = x + (target - x) * unwind[h - 1]
         spread = sigma * growth[h - 1]
-        rows.append([price6(x + z * spread) for z in Z])
+        rows.append([price6(median + z * spread) for z in Z])
     return rows
 
 
@@ -112,9 +131,11 @@ def main():
             raise ValueError(
                 "%s asks for quantiles %s, not %s" % (filename, quantiles, QUANTILES)
             )
+        markets = case["markets"]
+        total = sum((m.get("prices") or [0.0])[-1] for m in markets)
         forecasts = [
-            {"id": m["id"], "q": forecast_market(m, horizon)}
-            for m in case["markets"]
+            {"id": m["id"], "q": forecast_market(m, horizon, total)}
+            for m in markets
         ]
         out_path = os.path.join(OUTPUT_DIR, case_id + ".out")
         with open(out_path, "w", encoding="utf-8") as f:
